@@ -767,6 +767,7 @@ app.delete('/api/pi/logs', async (req, res) => {
 async function fetchPiInfo() {
   // Use simpler, faster commands to avoid timeout
   const uptimeResult = await executeSSHCommand('uptime -p 2>/dev/null || uptime');
+  const uptimeSecResult = await executeSSHCommand('cat /proc/uptime');
   const cpuTempResult = await executeSSHCommand("vcgencmd measure_temp 2>/dev/null || echo \"temp=N/A\"");
   const memResult = await executeSSHCommand('cat /proc/meminfo | grep MemAvailable');
   const statusResult = await executeSSHCommand('systemctl is-active ocr.service');
@@ -799,11 +800,38 @@ async function fetchPiInfo() {
     }
   }
 
+  // Parse uptime seconds and create Thai localized string
+  let uptimeSeconds = null;
+  let uptimeThai = null;
+  try {
+    const upClean = cleanOutput(uptimeSecResult.output || '');
+    const first = upClean.split(' ')[0];
+    const secs = parseFloat(first);
+    if (!Number.isNaN(secs)) {
+      uptimeSeconds = Math.floor(secs);
+      const h = Math.floor(uptimeSeconds / 3600);
+      const m = Math.floor((uptimeSeconds % 3600) / 60);
+      const s = uptimeSeconds % 60;
+      const parts = [];
+      if (h) parts.push(`${h} ชั่วโมง`);
+      if (m) parts.push(`${m} นาที`);
+      if (s || parts.length === 0) parts.push(`${s} วินาที`);
+      uptimeThai = parts.join(' ');
+    }
+  } catch (e) {
+    // ignore parse errors
+  }
+
   const statusClean = cleanOutput(statusResult.output || 'unknown');
+
+  // DEBUG: log uptime parsing results
+  console.log('[fetchPiInfo] uptimeSeconds=', uptimeSeconds, 'uptimeThai=', uptimeThai);
 
   return {
     success: true,
     uptime: cleanOutput(uptimeResult.output).replace('up ', ''),
+    uptimeSeconds: uptimeSeconds || 0,
+    uptimeThai: uptimeThai || '',
     cpuTemp: cleanOutput(cpuTempResult.output).replace('temp=', '').replace("'C", '°C'),
     memoryUsageRaw: memClean || 'N/A',
     memoryUsage: memoryFormatted,
@@ -811,12 +839,13 @@ async function fetchPiInfo() {
     status: statusClean,
     isRunning: statusClean === 'active'
   };
-}
+} 
 
 // Get Pi system info
 app.get('/api/pi/info', async (req, res) => {
   try {
     const info = await fetchPiInfo();
+    console.log('[route] /api/pi/info ->', info);
     res.json(info);
   } catch (err) {
     console.error('Error getting Pi info:', err);
@@ -836,8 +865,9 @@ setInterval(async () => {
   }
 }, 3000); // every 3 seconds
 
+console.log('[server-start] server.js file:', __filename);
 server.listen(port, () => {
   const host = process.env.HOST;
-  console.log(`Backend server listening at http://${host}:${port}`);
-  console.log(`WebSocket server listening at ws://${host}:${port}`);
+  console.log('[server-start] Backend server listening at', `http://${host}:${port}`);
+  console.log('[server-start] WebSocket server listening at', `ws://${host}:${port}`);
 });
