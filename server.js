@@ -224,7 +224,7 @@ app.get('/api/scanned-packages', async (req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT sp.id, sp.recipient_name, sp.address, sp.phone, sp.image_path, sp.raw_text, 
-              sp.tenant_id, t.name AS tenant_name, t.room AS tenant_room, t.tag AS tenant_tag, sp.scanned_at, sp.created_at
+              sp.tenant_id, t.name AS tenant_name, t.room AS tenant_room, t.tag AS tenant_tag, t.address AS tenant_address, sp.scanned_at, sp.created_at
        FROM scanned_packages sp
        LEFT JOIN tenants t ON sp.tenant_id = t.id
        ORDER BY sp.scanned_at DESC`
@@ -236,7 +236,7 @@ app.get('/api/scanned-packages', async (req, res) => {
       phone: row.phone,
       imagePath: row.image_path,
       rawText: row.raw_text,
-      tenant: row.tenant_id ? { id: row.tenant_id, name: row.tenant_name, room: row.tenant_room, tag: row.tenant_tag } : null,
+      tenant: row.tenant_id ? { id: row.tenant_id, name: row.tenant_name, room: row.tenant_room, tag: row.tenant_tag, address: row.tenant_address || null } : null,
       scannedAt: row.scanned_at,
       created_at: row.created_at,
     }));
