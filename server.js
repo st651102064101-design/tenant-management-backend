@@ -524,7 +524,7 @@ const PI_CONFIG = {
 };
 
 // Execute SSH command on Raspberry Pi using ssh2 client
-async function executeSSHCommand(command) {
+async function executeSSHCommand(command, timeoutMs = 20000) {
   const { host, port, username, password } = PI_CONFIG;
 
   return new Promise((resolve, reject) => {
@@ -547,7 +547,7 @@ async function executeSSHCommand(command) {
 
     const timeoutId = setTimeout(() => {
       finalize(new Error('SSH command timeout'));
-    }, 20000);
+    }, timeoutMs);
 
     conn
       .on('ready', () => {
@@ -736,6 +736,158 @@ app.post('/api/pi/telegram/test', async (req, res) => {
     addOCRLog(`❌ Telegram test failed: ${err.message}`);
     console.error('Error sending Telegram test:', err);
     return res.status(500).json({ error: 'Failed to send Telegram test', details: err.message });
+  }
+});
+
+// Capture image -> run Google OCR -> send OCR text to Telegram
+app.post('/api/pi/capture-telegram', async (req, res) => {
+  try {
+    const statusResult = await executeSSHCommand('systemctl is-active ocr.service 2>/dev/null || true');
+    const serviceStatus = (statusResult.output || '').trim();
+    if (serviceStatus !== 'active') {
+      addOCRLog('❌ Capture failed: OCR service is not active');
+      return res.status(500).json({
+        success: false,
+        error: 'OCR service ไม่ทำงาน กรุณากดถ่ายใหม่',
+        shouldRetry: true,
+      });
+    }
+
+    const envResult = await executeSSHCommand([
+      "token=$(systemctl show ocr.service --property=Environment --value 2>/dev/null | tr ' ' '\\n' | grep '^TELEGRAM_BOT_TOKEN=' | head -1 | cut -d= -f2-)",
+      "chat=$(systemctl show ocr.service --property=Environment --value 2>/dev/null | tr ' ' '\\n' | grep '^TELEGRAM_CHAT_ID=' | head -1 | cut -d= -f2-)",
+      "if [ -z \"$token\" ]; then token=$(grep -oP '^Environment=TELEGRAM_BOT_TOKEN=\\K.*' /etc/systemd/system/ocr.service 2>/dev/null | tail -1); fi",
+      "if [ -z \"$chat\" ]; then chat=$(grep -oP '^Environment=TELEGRAM_CHAT_ID=\\K.*' /etc/systemd/system/ocr.service 2>/dev/null | tail -1); fi",
+      "echo \"$token\"",
+      "echo \"$chat\"",
+    ].join(' ; '));
+
+    const envLines = (envResult.output || '').split('\n').map((line) => line.trim()).filter(Boolean);
+    const token = envLines[0] || '';
+    const chatId = envLines[1] || '';
+    if (!token || !chatId) {
+      addOCRLog('❌ Capture failed: missing Telegram token/chat id');
+      return res.status(500).json({
+        success: false,
+        error: 'ไม่พบค่า Telegram ในระบบ กรุณากดถ่ายใหม่',
+        shouldRetry: true,
+      });
+    }
+
+    const capturePath = '/tmp/manual_capture.jpg';
+    const captureCommand = [
+      `rm -f ${capturePath}`,
+      `if command -v libcamera-still >/dev/null 2>&1; then libcamera-still -n -t 1200 --width 1280 --height 720 -o ${capturePath} >/dev/null 2>&1; ` +
+        `elif command -v raspistill >/dev/null 2>&1; then raspistill -n -t 1200 -o ${capturePath} >/dev/null 2>&1; ` +
+        `elif command -v fswebcam >/dev/null 2>&1; then fswebcam -q --no-banner ${capturePath} >/dev/null 2>&1; ` +
+        `else echo NO_CAMERA_TOOL; fi`,
+      `[ -s ${capturePath} ] && echo CAPTURE_OK || echo CAPTURE_FAIL`,
+    ].join(' ; ');
+    const captureResult = await executeSSHCommand(captureCommand, 45000);
+    if (!(captureResult.output || '').includes('CAPTURE_OK')) {
+      addOCRLog('❌ Capture failed: cannot capture image from camera');
+      return res.status(500).json({
+        success: false,
+        error: 'ถ่ายภาพไม่สำเร็จ กรุณากดถ่ายใหม่',
+        shouldRetry: true,
+      });
+    }
+
+    const ocrAndTelegramCommand = [
+      `IMAGE_PATH=${shellSingleQuote(capturePath)} TELEGRAM_TOKEN=${shellSingleQuote(token)} TELEGRAM_CHAT_ID=${shellSingleQuote(chatId)} /home/admin/percel/venv/bin/python - <<'PY'`,
+      'import json, os, urllib.request, urllib.parse',
+      'from google.cloud import vision',
+      '',
+      'def fail(code, message):',
+      '    print(json.dumps({"success": False, "code": code, "message": message}, ensure_ascii=False))',
+      '    raise SystemExit(1)',
+      '',
+      'image_path = os.environ.get("IMAGE_PATH", "")',
+      'token = os.environ.get("TELEGRAM_TOKEN", "")',
+      'chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")',
+      'if not image_path or not token or not chat_id:',
+      '    fail("MISSING_ENV", "Missing image/token/chat")',
+      '',
+      'try:',
+      '    client = vision.ImageAnnotatorClient()',
+      '    with open(image_path, "rb") as f:',
+      '        content = f.read()',
+      '    response = client.text_detection(image=vision.Image(content=content))',
+      '    if response.error and response.error.message:',
+      '        fail("OCR_API_ERROR", response.error.message)',
+      '',
+      '    text = ""',
+      '    if response.text_annotations and len(response.text_annotations) > 0:',
+      '        text = (response.text_annotations[0].description or "").strip()',
+      '    if not text:',
+      '        fail("OCR_EMPTY", "OCR ไม่พบข้อความจากภาพ")',
+      '',
+      '    message = "📸 ผล OCR จากปุ่มถ่าย\\n\\n" + text[:3500]',
+      '    data = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")',
+      '    req = urllib.request.Request(',
+      '        f"https://api.telegram.org/bot{token}/sendMessage",',
+      '        data=data,',
+      '        headers={"Content-Type": "application/x-www-form-urlencoded"},',
+      '        method="POST",',
+      '    )',
+      '    with urllib.request.urlopen(req, timeout=20) as resp:',
+      '        tg = json.loads((resp.read() or b"{}").decode("utf-8", "ignore"))',
+      '    if not tg.get("ok"):',
+      '        fail("TELEGRAM_ERROR", str(tg.get("description") or "Telegram send failed"))',
+      '',
+      '    print(json.dumps({',
+      '        "success": True,',
+      '        "ocrText": text,',
+      '        "textPreview": text[:160],',
+      '        "telegram": tg,',
+      '    }, ensure_ascii=False))',
+      'except Exception as e:',
+      '    fail("OCR_RUNTIME", str(e))',
+      'PY',
+    ].join('\n');
+
+    const ocrResult = await executeSSHCommand(ocrAndTelegramCommand, 70000);
+    const outLines = (ocrResult.output || '').split('\n').map((line) => line.trim()).filter(Boolean);
+    const jsonLine = outLines[outLines.length - 1] || '{}';
+
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonLine);
+    } catch {
+      parsed = {
+        success: false,
+        code: 'INVALID_RESPONSE',
+        message: `Unexpected OCR response: ${jsonLine}`,
+      };
+    }
+
+    if (!parsed.success) {
+      addOCRLog(`❌ Capture/OCR failed: ${parsed.message || parsed.code || 'Unknown error'}`);
+      return res.status(500).json({
+        success: false,
+        error: `OCR ไม่สำเร็จ กรุณากดถ่ายใหม่ (${parsed.message || parsed.code || 'Unknown error'})`,
+        shouldRetry: true,
+        details: parsed,
+      });
+    }
+
+    addOCRLog('📸 Capture + OCR + Telegram sent successfully');
+    return res.json({
+      success: true,
+      message: 'ถ่ายภาพและส่ง OCR ไป Telegram สำเร็จ',
+      ocrText: parsed.ocrText,
+      textPreview: parsed.textPreview,
+      telegram: parsed.telegram,
+    });
+  } catch (err) {
+    addOCRLog(`❌ Capture/OCR exception: ${err.message}`);
+    console.error('Error capture+OCR+Telegram:', err);
+    return res.status(500).json({
+      success: false,
+      error: `OCR ไม่สำเร็จ กรุณากดถ่ายใหม่ (${err.message})`,
+      shouldRetry: true,
+      details: err.message,
+    });
   }
 });
 
