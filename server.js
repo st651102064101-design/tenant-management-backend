@@ -895,6 +895,8 @@ app.post('/api/pi/capture-telegram', async (req, res) => {
 // In-memory cache for telegram messages to avoid hitting API too often
 let telegramMsgCache = { messages: [], updatedAt: 0, offset: 0 };
 const TELEGRAM_CACHE_MS = 3000; // cache getUpdates results for 3s
+const telegramFilePathCache = new Map();
+const TELEGRAM_FILE_CACHE_MS = 5 * 60 * 1000;
 
 // Helper: read bot token & chat id from ocr.service env on Pi
 async function getTelegramCreds() {
@@ -911,6 +913,248 @@ async function getTelegramCreds() {
   const lines = (result.output || '').split('\n').map(l => l.trim()).filter(Boolean);
   return { token: lines[0] || '', chatId: lines[1] || '' };
 }
+
+function mapTelegramSender(msg = {}) {
+  if (msg.from) {
+    return {
+      id: msg.from.id,
+      name: [msg.from.first_name, msg.from.last_name].filter(Boolean).join(' ') || msg.from.username || 'Unknown',
+      username: msg.from.username || '',
+      isBot: Boolean(msg.from.is_bot),
+    };
+  }
+  return {
+    id: 0,
+    name: msg.chat?.title || 'Unknown',
+    username: '',
+    isBot: false,
+  };
+}
+
+function pickBestPhoto(photoList) {
+  if (!Array.isArray(photoList) || photoList.length === 0) return null;
+  return photoList.reduce((best, current) => {
+    const bestArea = (best?.width || 0) * (best?.height || 0);
+    const currentArea = (current?.width || 0) * (current?.height || 0);
+    return currentArea > bestArea ? current : best;
+  }, photoList[0]);
+}
+
+function resolveTelegramMedia(msg) {
+  const photo = pickBestPhoto(msg.photo);
+  if (photo && photo.file_id) {
+    return {
+      kind: 'photo',
+      fileId: photo.file_id,
+      width: photo.width || null,
+      height: photo.height || null,
+      size: photo.file_size || null,
+    };
+  }
+
+  if (msg.video && msg.video.file_id) {
+    return {
+      kind: 'video',
+      fileId: msg.video.file_id,
+      width: msg.video.width || null,
+      height: msg.video.height || null,
+      duration: msg.video.duration || null,
+      fileName: msg.video.file_name || '',
+      mimeType: msg.video.mime_type || '',
+      size: msg.video.file_size || null,
+    };
+  }
+
+  if (msg.animation && msg.animation.file_id) {
+    return {
+      kind: 'animation',
+      fileId: msg.animation.file_id,
+      width: msg.animation.width || null,
+      height: msg.animation.height || null,
+      duration: msg.animation.duration || null,
+      fileName: msg.animation.file_name || '',
+      mimeType: msg.animation.mime_type || '',
+      size: msg.animation.file_size || null,
+    };
+  }
+
+  if (msg.sticker && msg.sticker.file_id) {
+    return {
+      kind: 'sticker',
+      fileId: msg.sticker.file_id,
+      emoji: msg.sticker.emoji || '',
+      width: msg.sticker.width || null,
+      height: msg.sticker.height || null,
+      isAnimated: Boolean(msg.sticker.is_animated),
+      isVideo: Boolean(msg.sticker.is_video),
+      setName: msg.sticker.set_name || '',
+      size: msg.sticker.file_size || null,
+    };
+  }
+
+  if (msg.voice && msg.voice.file_id) {
+    return {
+      kind: 'voice',
+      fileId: msg.voice.file_id,
+      duration: msg.voice.duration || null,
+      mimeType: msg.voice.mime_type || 'audio/ogg',
+      size: msg.voice.file_size || null,
+    };
+  }
+
+  if (msg.audio && msg.audio.file_id) {
+    return {
+      kind: 'audio',
+      fileId: msg.audio.file_id,
+      duration: msg.audio.duration || null,
+      performer: msg.audio.performer || '',
+      title: msg.audio.title || '',
+      fileName: msg.audio.file_name || '',
+      mimeType: msg.audio.mime_type || 'audio/mpeg',
+      size: msg.audio.file_size || null,
+    };
+  }
+
+  if (msg.document && msg.document.file_id) {
+    return {
+      kind: 'document',
+      fileId: msg.document.file_id,
+      fileName: msg.document.file_name || '',
+      mimeType: msg.document.mime_type || '',
+      size: msg.document.file_size || null,
+    };
+  }
+
+  return null;
+}
+
+function mapTelegramMessage(msg, updateId = 0) {
+  const media = resolveTelegramMedia(msg);
+  const mapped = {
+    id: msg.message_id,
+    updateId,
+    from: mapTelegramSender(msg),
+    text: msg.text || msg.caption || '',
+    rawText: msg.text || '',
+    caption: msg.caption || '',
+    date: msg.date,
+    editDate: msg.edit_date || null,
+    replyTo: msg.reply_to_message ? msg.reply_to_message.message_id : null,
+    forwardFrom: msg.forward_from_chat?.title || msg.forward_sender_name || '',
+    location: msg.location
+      ? { latitude: msg.location.latitude, longitude: msg.location.longitude }
+      : null,
+    venue: msg.venue
+      ? {
+          title: msg.venue.title || '',
+          address: msg.venue.address || '',
+          latitude: msg.venue.location?.latitude || null,
+          longitude: msg.venue.location?.longitude || null,
+        }
+      : null,
+    contact: msg.contact
+      ? {
+          phoneNumber: msg.contact.phone_number || '',
+          firstName: msg.contact.first_name || '',
+          lastName: msg.contact.last_name || '',
+          userId: msg.contact.user_id || null,
+        }
+      : null,
+    poll: msg.poll
+      ? {
+          question: msg.poll.question || '',
+          totalVoterCount: msg.poll.total_voter_count || 0,
+          options: Array.isArray(msg.poll.options)
+            ? msg.poll.options.map((option) => ({ text: option.text, voterCount: option.voter_count }))
+            : [],
+        }
+      : null,
+    media,
+    hasPhoto: media?.kind === 'photo',
+    hasDocument: media?.kind === 'document',
+  };
+
+  if (mapped.media && mapped.media.fileId) {
+    mapped.media.url = `/api/pi/telegram/file/${encodeURIComponent(mapped.media.fileId)}`;
+  }
+
+  return mapped;
+}
+
+function appendTelegramMessages(newMessages) {
+  if (!Array.isArray(newMessages) || newMessages.length === 0) return;
+  const merged = [...telegramMsgCache.messages, ...newMessages];
+  const seen = new Set();
+  const dedupedReversed = [];
+
+  for (let i = merged.length - 1; i >= 0; i -= 1) {
+    const msg = merged[i];
+    const key = `${msg.id}:${msg.date}:${msg.from?.id || 0}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dedupedReversed.push(msg);
+  }
+
+  dedupedReversed.reverse();
+  telegramMsgCache.messages = dedupedReversed.slice(-100);
+}
+
+async function getTelegramFilePath(token, fileId) {
+  const cacheKey = `${token}:${fileId}`;
+  const cached = telegramFilePathCache.get(cacheKey);
+  if (cached && Date.now() - cached.updatedAt < TELEGRAM_FILE_CACHE_MS) {
+    return cached.filePath;
+  }
+
+  const response = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  if (!response.ok) {
+    throw new Error(`getFile failed (${response.status})`);
+  }
+  const payload = await response.json();
+  if (!payload.ok || !payload.result?.file_path) {
+    throw new Error(payload.description || 'Unable to resolve Telegram file path');
+  }
+
+  telegramFilePathCache.set(cacheKey, {
+    filePath: payload.result.file_path,
+    updatedAt: Date.now(),
+  });
+  return payload.result.file_path;
+}
+
+app.get('/api/pi/telegram/file/:fileId', async (req, res) => {
+  try {
+    const fileId = decodeURIComponent(req.params.fileId || '').trim();
+    if (!fileId) {
+      return res.status(400).json({ success: false, error: 'fileId is required' });
+    }
+
+    const { token } = await getTelegramCreds();
+    if (!token) {
+      return res.status(500).json({ success: false, error: 'ไม่พบ Telegram token' });
+    }
+
+    const filePath = await getTelegramFilePath(token, fileId);
+    const fileResponse = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+    if (!fileResponse.ok) {
+      return res.status(502).json({ success: false, error: `Cannot download file (${fileResponse.status})` });
+    }
+
+    const contentType = fileResponse.headers.get('content-type') || 'application/octet-stream';
+    const contentLength = fileResponse.headers.get('content-length');
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=120');
+
+    const arrayBuffer = await fileResponse.arrayBuffer();
+    return res.status(200).send(Buffer.from(arrayBuffer));
+  } catch (err) {
+    console.error('Error proxying Telegram file:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // GET /api/pi/telegram/messages — fetch recent chat from Telegram group
 app.get('/api/pi/telegram/messages', async (req, res) => {
@@ -933,7 +1177,8 @@ app.get('/api/pi/telegram/messages', async (req, res) => {
     }
 
     // Use getUpdates to fetch recent messages — limited to last 100
-    const curlCmd = `curl -sS "https://api.telegram.org/bot${token}/getUpdates?offset=${telegramMsgCache.offset}&limit=100&allowed_updates=%5B%22message%22%5D&timeout=0" 2>/dev/null`;
+    const allowedUpdates = encodeURIComponent(JSON.stringify(['message', 'edited_message', 'channel_post', 'edited_channel_post']));
+    const curlCmd = `curl -sS "https://api.telegram.org/bot${token}/getUpdates?offset=${telegramMsgCache.offset}&limit=100&allowed_updates=${allowedUpdates}&timeout=0" 2>/dev/null`;
     const result = await executeSSHCommand(curlCmd, 15000);
     const raw = (result.output || '').trim();
 
@@ -945,34 +1190,31 @@ app.get('/api/pi/telegram/messages', async (req, res) => {
     }
 
     if (!parsed.ok) {
-      return res.status(500).json({ success: false, error: parsed.description || 'Telegram API error' });
+      const description = parsed.description || 'Telegram API error';
+      if (/Conflict: terminated by other getUpdates request/i.test(description)) {
+        return res.json({
+          success: true,
+          messages: telegramMsgCache.messages,
+          fromCache: true,
+          fetchedAt: telegramMsgCache.updatedAt || now,
+          warning: 'telegram_getupdates_conflict',
+          warningMessage: 'มี service อื่นเรียก getUpdates อยู่ จึงอ่านสดพร้อมกันไม่ได้',
+        });
+      }
+      return res.status(500).json({ success: false, error: description });
     }
 
     const targetChatId = String(chatId);
     const newMessages = [];
 
     for (const update of (parsed.result || [])) {
-      const msg = update.message || update.channel_post;
+      const msg = update.message || update.edited_message || update.channel_post || update.edited_channel_post;
       if (!msg) continue;
 
       // Filter only messages from our target group
       if (String(msg.chat?.id) !== targetChatId) continue;
 
-      newMessages.push({
-        id: msg.message_id,
-        updateId: update.update_id,
-        from: msg.from ? {
-          id: msg.from.id,
-          name: [msg.from.first_name, msg.from.last_name].filter(Boolean).join(' '),
-          username: msg.from.username || '',
-          isBot: msg.from.is_bot || false,
-        } : { id: 0, name: msg.chat?.title || 'Unknown', username: '', isBot: false },
-        text: msg.text || msg.caption || '',
-        date: msg.date,
-        hasPhoto: !!(msg.photo && msg.photo.length > 0),
-        hasDocument: !!msg.document,
-        replyTo: msg.reply_to_message ? msg.reply_to_message.message_id : null,
-      });
+      newMessages.push(mapTelegramMessage(msg, update.update_id));
 
       // Update offset to acknowledge processed messages
       if (update.update_id >= telegramMsgCache.offset) {
@@ -980,13 +1222,7 @@ app.get('/api/pi/telegram/messages', async (req, res) => {
       }
     }
 
-    // Append new messages and keep last 100
-    if (newMessages.length > 0) {
-      telegramMsgCache.messages.push(...newMessages);
-      if (telegramMsgCache.messages.length > 100) {
-        telegramMsgCache.messages = telegramMsgCache.messages.slice(-100);
-      }
-    }
+    appendTelegramMessages(newMessages);
 
     telegramMsgCache.updatedAt = now;
     return res.json({
@@ -1035,24 +1271,7 @@ app.post('/api/pi/telegram/send', async (req, res) => {
     // Also add the sent message to our cache immediately
     const sentMsg = tg.result;
     if (sentMsg) {
-      telegramMsgCache.messages.push({
-        id: sentMsg.message_id,
-        updateId: 0,
-        from: sentMsg.from ? {
-          id: sentMsg.from.id,
-          name: [sentMsg.from.first_name, sentMsg.from.last_name].filter(Boolean).join(' '),
-          username: sentMsg.from.username || '',
-          isBot: sentMsg.from.is_bot || false,
-        } : { id: 0, name: 'Bot', username: '', isBot: true },
-        text: sentMsg.text || '',
-        date: sentMsg.date,
-        hasPhoto: false,
-        hasDocument: false,
-        replyTo: null,
-      });
-      if (telegramMsgCache.messages.length > 100) {
-        telegramMsgCache.messages = telegramMsgCache.messages.slice(-100);
-      }
+      appendTelegramMessages([mapTelegramMessage(sentMsg, 0)]);
     }
 
     return res.json({ success: true, telegram: tg });
