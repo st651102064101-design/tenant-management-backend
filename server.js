@@ -891,6 +891,177 @@ app.post('/api/pi/capture-telegram', async (req, res) => {
   }
 });
 
+// ─── Telegram Chat Preview ────────────────────────────────────────
+// In-memory cache for telegram messages to avoid hitting API too often
+let telegramMsgCache = { messages: [], updatedAt: 0, offset: 0 };
+const TELEGRAM_CACHE_MS = 3000; // cache getUpdates results for 3s
+
+// Helper: read bot token & chat id from ocr.service env on Pi
+async function getTelegramCreds() {
+  const command = [
+    "token=$(systemctl show ocr.service --property=Environment --value 2>/dev/null | tr ' ' '\\n' | grep '^TELEGRAM_BOT_TOKEN=' | head -1 | cut -d= -f2-)",
+    "chat=$(systemctl show ocr.service --property=Environment --value 2>/dev/null | tr ' ' '\\n' | grep '^TELEGRAM_CHAT_ID=' | head -1 | cut -d= -f2-)",
+    "if [ -z \"$token\" ]; then token=$(grep -oP '^Environment=TELEGRAM_BOT_TOKEN=\\K.*' /etc/systemd/system/ocr.service 2>/dev/null | tail -1); fi",
+    "if [ -z \"$chat\" ]; then chat=$(grep -oP '^Environment=TELEGRAM_CHAT_ID=\\K.*' /etc/systemd/system/ocr.service 2>/dev/null | tail -1); fi",
+    "echo \"$token\"",
+    "echo \"$chat\"",
+  ].join(' ; ');
+
+  const result = await executeSSHCommand(command);
+  const lines = (result.output || '').split('\n').map(l => l.trim()).filter(Boolean);
+  return { token: lines[0] || '', chatId: lines[1] || '' };
+}
+
+// GET /api/pi/telegram/messages — fetch recent chat from Telegram group
+app.get('/api/pi/telegram/messages', async (req, res) => {
+  try {
+    const now = Date.now();
+    const forceRefresh = String(req.query.force || '') === '1';
+    // Return cached results if still fresh
+    if (!forceRefresh && now - telegramMsgCache.updatedAt < TELEGRAM_CACHE_MS && telegramMsgCache.messages.length > 0) {
+      return res.json({
+        success: true,
+        messages: telegramMsgCache.messages,
+        fromCache: true,
+        fetchedAt: telegramMsgCache.updatedAt,
+      });
+    }
+
+    const { token, chatId } = await getTelegramCreds();
+    if (!token || !chatId) {
+      return res.status(500).json({ success: false, error: 'ไม่พบ Telegram credentials ใน ocr.service' });
+    }
+
+    // Use getUpdates to fetch recent messages — limited to last 100
+    const curlCmd = `curl -sS "https://api.telegram.org/bot${token}/getUpdates?offset=${telegramMsgCache.offset}&limit=100&allowed_updates=%5B%22message%22%5D&timeout=0" 2>/dev/null`;
+    const result = await executeSSHCommand(curlCmd, 15000);
+    const raw = (result.output || '').trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return res.status(500).json({ success: false, error: 'ไม่สามารถอ่านข้อมูลจาก Telegram API' });
+    }
+
+    if (!parsed.ok) {
+      return res.status(500).json({ success: false, error: parsed.description || 'Telegram API error' });
+    }
+
+    const targetChatId = String(chatId);
+    const newMessages = [];
+
+    for (const update of (parsed.result || [])) {
+      const msg = update.message || update.channel_post;
+      if (!msg) continue;
+
+      // Filter only messages from our target group
+      if (String(msg.chat?.id) !== targetChatId) continue;
+
+      newMessages.push({
+        id: msg.message_id,
+        updateId: update.update_id,
+        from: msg.from ? {
+          id: msg.from.id,
+          name: [msg.from.first_name, msg.from.last_name].filter(Boolean).join(' '),
+          username: msg.from.username || '',
+          isBot: msg.from.is_bot || false,
+        } : { id: 0, name: msg.chat?.title || 'Unknown', username: '', isBot: false },
+        text: msg.text || msg.caption || '',
+        date: msg.date,
+        hasPhoto: !!(msg.photo && msg.photo.length > 0),
+        hasDocument: !!msg.document,
+        replyTo: msg.reply_to_message ? msg.reply_to_message.message_id : null,
+      });
+
+      // Update offset to acknowledge processed messages
+      if (update.update_id >= telegramMsgCache.offset) {
+        telegramMsgCache.offset = update.update_id + 1;
+      }
+    }
+
+    // Append new messages and keep last 100
+    if (newMessages.length > 0) {
+      telegramMsgCache.messages.push(...newMessages);
+      if (telegramMsgCache.messages.length > 100) {
+        telegramMsgCache.messages = telegramMsgCache.messages.slice(-100);
+      }
+    }
+
+    telegramMsgCache.updatedAt = now;
+    return res.json({
+      success: true,
+      messages: telegramMsgCache.messages,
+      fromCache: false,
+      fetchedAt: telegramMsgCache.updatedAt,
+      newCount: newMessages.length,
+    });
+  } catch (err) {
+    console.error('Error fetching Telegram messages:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/pi/telegram/send — send a message to the group
+app.post('/api/pi/telegram/send', async (req, res) => {
+  const { message: msgText } = req.body || {};
+  if (!msgText || !String(msgText).trim()) {
+    return res.status(400).json({ success: false, error: 'ข้อความว่างเปล่า' });
+  }
+
+  try {
+    const { token, chatId } = await getTelegramCreds();
+    if (!token || !chatId) {
+      return res.status(500).json({ success: false, error: 'ไม่พบ Telegram credentials' });
+    }
+
+    const safeMsg = shellSingleQuote(String(msgText).trim());
+    const curlCmd = `msg=${safeMsg}; curl -sS -X POST "https://api.telegram.org/bot${token}/sendMessage" --data-urlencode "chat_id=${chatId}" --data-urlencode "text=$msg" 2>/dev/null`;
+    const result = await executeSSHCommand(curlCmd, 15000);
+    const raw = (result.output || '').split('\n').map(l => l.trim()).filter(Boolean);
+    const lastLine = raw[raw.length - 1] || '{}';
+
+    let tg;
+    try {
+      tg = JSON.parse(lastLine);
+    } catch {
+      tg = { ok: false, description: 'Unexpected response' };
+    }
+
+    if (!tg.ok) {
+      return res.status(500).json({ success: false, error: tg.description || 'Send failed' });
+    }
+
+    // Also add the sent message to our cache immediately
+    const sentMsg = tg.result;
+    if (sentMsg) {
+      telegramMsgCache.messages.push({
+        id: sentMsg.message_id,
+        updateId: 0,
+        from: sentMsg.from ? {
+          id: sentMsg.from.id,
+          name: [sentMsg.from.first_name, sentMsg.from.last_name].filter(Boolean).join(' '),
+          username: sentMsg.from.username || '',
+          isBot: sentMsg.from.is_bot || false,
+        } : { id: 0, name: 'Bot', username: '', isBot: true },
+        text: sentMsg.text || '',
+        date: sentMsg.date,
+        hasPhoto: false,
+        hasDocument: false,
+        replyTo: null,
+      });
+      if (telegramMsgCache.messages.length > 100) {
+        telegramMsgCache.messages = telegramMsgCache.messages.slice(-100);
+      }
+    }
+
+    return res.json({ success: true, telegram: tg });
+  } catch (err) {
+    console.error('Error sending Telegram message:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Get Pi volume setting
 app.get('/api/pi/volume', async (req, res) => {
   try {
