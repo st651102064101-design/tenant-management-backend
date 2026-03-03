@@ -20,6 +20,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const WebSocket = require('ws');
+const { Client } = require('ssh2');
 
 const app = express();
 const server = http.createServer(app);
@@ -517,32 +518,72 @@ const PI_CONFIG = {
   password: process.env.PI_PASSWORD || 'pipi123',
 };
 
-const { exec } = require('child_process');
-const util = require('util');
-const execAsync = util.promisify(exec);
-
-// Execute SSH command on Raspberry Pi using sshpass
+// Execute SSH command on Raspberry Pi using ssh2 client
 async function executeSSHCommand(command) {
   const { host, port, username, password } = PI_CONFIG;
-  
-  // Escape single quotes in command
-  const escapedCommand = command.replace(/'/g, "'\\''");
-  
-  // Use sshpass with minimal options
-  const sshCommand = `sshpass -p '${password}' ssh -4 -o ConnectTimeout=3 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -p ${port} ${username}@${host} '${escapedCommand}' 2>&1`;
-  
-  try {
-    const { stdout } = await execAsync(sshCommand, { timeout: 8000, maxBuffer: 1024 * 1024 });
-    return { code: 0, output: stdout, errorOutput: '' };
-  } catch (err) {
-    if (err.killed) {
-      throw new Error('SSH command timeout');
-    }
-    if (err.stdout || err.stderr) {
-      return { code: err.code || 1, output: err.stdout || '', errorOutput: err.stderr || '' };
-    }
-    throw err;
-  }
+
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    let output = '';
+    let errorOutput = '';
+    let settled = false;
+
+    const finalize = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      conn.end();
+      if (error) {
+        reject(error);
+      } else {
+        resolve(result);
+      }
+    };
+
+    const timeoutId = setTimeout(() => {
+      finalize(new Error('SSH command timeout'));
+    }, 20000);
+
+    conn
+      .on('ready', () => {
+        conn.exec(command, (err, stream) => {
+          if (err) {
+            finalize(err);
+            return;
+          }
+
+          stream
+            .on('close', (code) => {
+              finalize(null, {
+                code: typeof code === 'number' ? code : 0,
+                output,
+                errorOutput,
+              });
+            })
+            .on('data', (data) => {
+              output += data.toString();
+            });
+
+          stream.stderr.on('data', (data) => {
+            errorOutput += data.toString();
+          });
+        });
+      })
+      .on('error', (err) => {
+        finalize(err);
+      })
+      .connect({
+        host,
+        port,
+        username,
+        password,
+        readyTimeout: 5000,
+      });
+  });
+}
+
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
 // Speak on Pi via TTS
@@ -603,6 +644,349 @@ app.post('/api/pi/volume', async (req, res) => {
   } catch (err) {
     console.error('Error setting Pi volume:', err);
     res.status(500).json({ error: 'Failed to set Pi volume', details: err.message });
+  }
+});
+
+// Get current Pi Wi-Fi status
+app.get('/api/pi/wifi', async (req, res) => {
+  try {
+    const statusResult = await executeSSHCommand('nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status');
+    const lines = (statusResult.output || '').split('\n').map(line => line.trim()).filter(Boolean);
+
+    const parsed = lines
+      .map((line) => {
+        const match = line.match(/^([^:]+):([^:]+):([^:]+):(.*)$/);
+        if (!match) return null;
+        return {
+          device: match[1],
+          type: match[2],
+          state: match[3],
+          connection: match[4] || '',
+        };
+      })
+      .filter(Boolean);
+
+    const wifi = parsed.find((item) => item.type === 'wifi' && item.state === 'connected');
+    const lan = parsed.find((item) => item.type === 'ethernet' && item.state === 'connected');
+
+    const routeResult = await executeSSHCommand("ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}'");
+    const activeInterface = (routeResult.output || '').trim();
+
+    let connectionType = 'none';
+    let interfaceName = null;
+    let connectionName = '';
+    if (activeInterface && wifi && activeInterface === wifi.device) {
+      connectionType = 'wifi';
+      interfaceName = wifi.device;
+      connectionName = wifi.connection;
+    } else if (activeInterface && lan && activeInterface === lan.device) {
+      connectionType = 'lan';
+      interfaceName = lan.device;
+      connectionName = lan.connection;
+    } else if (wifi) {
+      connectionType = 'wifi';
+      interfaceName = wifi.device;
+      connectionName = wifi.connection;
+    } else if (lan) {
+      connectionType = 'lan';
+      interfaceName = lan.device;
+      connectionName = lan.connection;
+    }
+
+    const ssid = wifi ? wifi.connection : '';
+
+    res.json({
+      success: true,
+      ssid,
+      connected: connectionType !== 'none',
+      wifiConnected: Boolean(wifi),
+      lanConnected: Boolean(lan),
+      connectionType,
+      activeInterface: activeInterface || interfaceName,
+      interface: interfaceName,
+      connectionName,
+      wifiInterface: wifi ? wifi.device : null,
+      wifiName: wifi ? wifi.connection : '',
+      lanInterface: lan ? lan.device : null,
+      lanName: lan ? lan.connection : '',
+    });
+  } catch (err) {
+    console.error('Error getting Pi Wi-Fi status:', err);
+    res.status(500).json({ error: 'Failed to get Pi Wi-Fi status', details: err.message });
+  }
+});
+
+// Update Pi Wi-Fi configuration (SSID / password)
+app.post('/api/pi/wifi', async (req, res) => {
+  const { ssid, password } = req.body;
+
+  if (!ssid || !password) {
+    return res.status(400).json({ error: 'Missing ssid or password' });
+  }
+
+  try {
+    const safeSsid = shellSingleQuote(ssid);
+    const safePassword = shellSingleQuote(password);
+
+    const connectCommand = [
+      'echo 1234 | sudo -S nmcli dev wifi rescan ifname wlan0',
+      `echo 1234 | sudo -S nmcli --wait 30 dev wifi connect ${safeSsid} password ${safePassword} ifname wlan0`,
+    ].join(' && ');
+
+    const connectResult = await executeSSHCommand(connectCommand);
+
+    if (connectResult.code !== 0) {
+      return res.status(500).json({
+        error: 'Failed to update Pi Wi-Fi',
+        details: (connectResult.errorOutput || connectResult.output || 'Unknown error').trim(),
+      });
+    }
+
+    // wait a bit before checking active status
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const verifyResult = await executeSSHCommand('nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status');
+    const lines = (verifyResult.output || '').split('\n').map(line => line.trim()).filter(Boolean);
+    const wifi = lines
+      .map((line) => {
+        const match = line.match(/^([^:]+):([^:]+):([^:]+):(.*)$/);
+        if (!match) return null;
+        return {
+          device: match[1],
+          type: match[2],
+          state: match[3],
+          connection: match[4] || '',
+        };
+      })
+      .filter(Boolean)
+      .find((item) => item.type === 'wifi' && item.state === 'connected');
+
+    if (!wifi) {
+      return res.status(500).json({
+        error: 'Wi-Fi command sent but not connected',
+        details: 'Raspberry Pi ยังไม่เชื่อม Wi-Fi สำเร็จ (ตรวจสอบรหัสผ่าน/สัญญาณ hotspot)',
+      });
+    }
+
+    // best effort: keep profile auto-connect; do not fail whole request if this step errors
+    await executeSSHCommand(`echo 1234 | sudo -S nmcli connection modify ${shellSingleQuote(wifi.connection)} connection.autoconnect yes`).catch(() => {});
+
+    addOCRLog(`📶 Wi-Fi updated to SSID: ${ssid}`);
+    res.json({
+      success: true,
+      message: 'Wi-Fi updated successfully',
+      ssid: wifi.connection || ssid,
+      connected: true,
+    });
+  } catch (err) {
+    console.error('Error updating Pi Wi-Fi:', err);
+    res.status(500).json({ error: 'Failed to update Pi Wi-Fi', details: err.message });
+  }
+});
+
+// Switch preferred active path between Wi-Fi and LAN when both are connected
+app.post('/api/pi/network/prefer', async (req, res) => {
+  const { target } = req.body;
+  if (!target || !['wifi', 'lan'].includes(target)) {
+    return res.status(400).json({ error: 'Invalid target. Use wifi or lan' });
+  }
+
+  try {
+    const statusResult = await executeSSHCommand('nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status');
+    const lines = (statusResult.output || '').split('\n').map(line => line.trim()).filter(Boolean);
+    const parsed = lines
+      .map((line) => {
+        const match = line.match(/^([^:]+):([^:]+):([^:]+):(.*)$/);
+        if (!match) return null;
+        return {
+          device: match[1],
+          type: match[2],
+          state: match[3],
+          connection: match[4] || '',
+        };
+      })
+      .filter(Boolean);
+
+    const wifi = parsed.find((item) => item.type === 'wifi' && item.state === 'connected');
+    const lan = parsed.find((item) => item.type === 'ethernet' && item.state === 'connected');
+
+    // Fallback: if target path is not currently connected, try known saved connections
+    const savedConnectionsResult = await executeSSHCommand('nmcli -t -f NAME,TYPE connection show');
+    const savedLines = (savedConnectionsResult.output || '').split('\n').map((line) => line.trim()).filter(Boolean);
+
+    function splitNmcliEscaped(line) {
+      const parts = [];
+      let current = '';
+      for (let index = 0; index < line.length; index++) {
+        if (line[index] === '\\' && index + 1 < line.length && line[index + 1] === ':') {
+          current += ':';
+          index++;
+        } else if (line[index] === ':') {
+          parts.push(current);
+          current = '';
+        } else {
+          current += line[index];
+        }
+      }
+      parts.push(current);
+      return parts;
+    }
+
+    const savedConnections = savedLines
+      .map((line) => {
+        const fields = splitNmcliEscaped(line);
+        if (fields.length < 2) return null;
+        return {
+          name: fields[0],
+          type: fields[1],
+        };
+      })
+      .filter(Boolean);
+
+    const fallbackWifi = savedConnections.find((item) => item.type === '802-11-wireless');
+    const fallbackLan = savedConnections.find((item) => item.type === '802-3-ethernet');
+
+    let preferred = target === 'wifi' ? wifi : lan;
+    let secondary = target === 'wifi' ? lan : wifi;
+
+    if (!preferred) {
+      if (target === 'wifi' && fallbackWifi) {
+        preferred = { device: null, connection: fallbackWifi.name };
+      } else if (target === 'lan' && fallbackLan) {
+        preferred = { device: null, connection: fallbackLan.name };
+      }
+    }
+
+    if (!secondary) {
+      if (target === 'wifi' && fallbackLan) {
+        secondary = { device: null, connection: fallbackLan.name };
+      } else if (target === 'lan' && fallbackWifi) {
+        secondary = { device: null, connection: fallbackWifi.name };
+      }
+    }
+
+    if (!preferred || !preferred.connection) {
+      return res.status(400).json({
+        error: target === 'wifi' ? 'Wi-Fi connection profile not found' : 'LAN connection profile not found',
+      });
+    }
+
+    const commands = [
+      `echo 1234 | sudo -S nmcli connection modify ${shellSingleQuote(preferred.connection)} ipv4.route-metric 50 ipv6.route-metric 50`,
+      `echo 1234 | sudo -S nmcli connection up ${shellSingleQuote(preferred.connection)}`,
+    ];
+    if (secondary) {
+      commands.push(`echo 1234 | sudo -S nmcli connection modify ${shellSingleQuote(secondary.connection)} ipv4.route-metric 300 ipv6.route-metric 300`);
+      commands.push(`echo 1234 | sudo -S nmcli connection up ${shellSingleQuote(secondary.connection)}`);
+    }
+
+    const switchResult = await executeSSHCommand(commands.join(' && '));
+    if (switchResult.code !== 0) {
+      return res.status(500).json({
+        error: 'Failed to switch preferred network',
+        details: (switchResult.errorOutput || switchResult.output || 'Unknown error').trim(),
+      });
+    }
+
+    addOCRLog(`🌐 Preferred network switched to ${target.toUpperCase()}`);
+    res.json({
+      success: true,
+      target,
+      message: `Preferred network switched to ${target}`,
+      preferredInterface: preferred.device || null,
+      preferredConnection: preferred.connection,
+    });
+  } catch (err) {
+    console.error('Error switching preferred network:', err);
+    res.status(500).json({ error: 'Failed to switch preferred network', details: err.message });
+  }
+});
+
+// Scan available Wi-Fi networks
+app.get('/api/pi/wifi/scan', async (req, res) => {
+  try {
+    // Trigger a fresh rescan first, then list
+    await executeSSHCommand('echo 1234 | sudo -S nmcli dev wifi rescan ifname wlan0 2>/dev/null || true');
+    // Small delay to allow scan results to populate
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    const result = await executeSSHCommand(
+      'nmcli -t -f SSID,SIGNAL,SECURITY,FREQ,BSSID,IN-USE dev wifi list ifname wlan0'
+    );
+
+    if (result.code !== 0) {
+      return res.status(500).json({
+        error: 'Failed to scan Wi-Fi',
+        details: (result.errorOutput || result.output || 'Unknown error').trim(),
+      });
+    }
+
+    const lines = (result.output || '').split('\n').map((l) => l.trim()).filter(Boolean);
+
+    // Parse nmcli colon-separated output.
+    // nmcli escapes literal colons inside values as \:
+    // We split on un-escaped colons only.
+    function splitNmcliLine(line) {
+      const parts = [];
+      let cur = '';
+      for (let i = 0; i < line.length; i++) {
+        if (line[i] === '\\' && i + 1 < line.length && line[i + 1] === ':') {
+          cur += ':';
+          i++; // skip next char
+        } else if (line[i] === ':') {
+          parts.push(cur);
+          cur = '';
+        } else {
+          cur += line[i];
+        }
+      }
+      parts.push(cur);
+      return parts;
+    }
+
+    const seen = new Set();
+    const networks = [];
+
+    for (const line of lines) {
+      const parts = splitNmcliLine(line);
+      if (parts.length < 6) continue;
+
+      const ssid = parts[0].trim();
+      if (!ssid || ssid === '--') continue; // skip hidden/empty SSIDs
+
+      const signal = parseInt(parts[1], 10) || 0;
+      const security = parts[2].trim() || 'Open';
+      const freq = parts[3].trim();
+      const bssid = parts[4].trim();
+      const inUse = parts[5].trim() === '*';
+
+      // De-duplicate by SSID (keep strongest signal)
+      if (seen.has(ssid)) {
+        const existing = networks.find((n) => n.ssid === ssid);
+        if (existing && signal > existing.signal) {
+          existing.signal = signal;
+          existing.security = security;
+          existing.freq = freq;
+          existing.bssid = bssid;
+          existing.inUse = existing.inUse || inUse;
+        }
+        continue;
+      }
+
+      seen.add(ssid);
+      networks.push({ ssid, signal, security, freq, bssid, inUse });
+    }
+
+    // Sort: in-use first, then by signal descending
+    networks.sort((a, b) => {
+      if (a.inUse !== b.inUse) return a.inUse ? -1 : 1;
+      return b.signal - a.signal;
+    });
+
+    res.json({ success: true, networks });
+  } catch (err) {
+    console.error('Error scanning Wi-Fi:', err);
+    res.status(500).json({ error: 'Failed to scan Wi-Fi', details: err.message });
   }
 });
 
