@@ -26,6 +26,10 @@ On startup the server creates a MySQL database named **tenant_management_db** (i
 
 ## Setup and usage
 
+ssh admin@192.168.1.132
+u: admin
+p: 1234
+
 1. Install dependencies:
    ```bash
    npm install
