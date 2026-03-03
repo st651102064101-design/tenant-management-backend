@@ -603,7 +603,15 @@ tts = gTTS(text='${escapedText}', lang='th')
 tts.save('/tmp/speak_remote.mp3')
 env = os.environ.copy()
 env['XDG_RUNTIME_DIR'] = '/run/user/1000'
-subprocess.run(['mpv', '--no-video', '--speed=1.5', '--ao=alsa', '/tmp/speak_remote.mp3'], env=env)
+volume = 80
+try:
+  import json
+  with open('/home/admin/percel/volume_config.json', 'r', encoding='utf-8') as f:
+    volume = int(json.load(f).get('volume', 80))
+except Exception:
+  volume = 80
+volume = max(0, min(100, volume))
+subprocess.run(['mpv', '--no-video', '--speed=1.5', '--ao=alsa', f'--volume={volume}', '/tmp/speak_remote.mp3'], env=env)
 " > /dev/null 2>&1 &
 echo "Speak started"`;
     const result = await executeSSHCommand(command);
@@ -621,7 +629,7 @@ app.get('/api/pi/volume', async (req, res) => {
     const command = `cat ${volumeFile} 2>/dev/null || echo '{"volume": 80}'`;
     const result = await executeSSHCommand(command);
     const config = JSON.parse(result.output.trim());
-    res.json({ success: true, volume: config.volume || 80 });
+    res.json({ success: true, volume: config.volume ?? 80 });
   } catch (err) {
     console.error('Error getting Pi volume:', err);
     res.json({ success: true, volume: 80 }); // Default volume
@@ -631,16 +639,24 @@ app.get('/api/pi/volume', async (req, res) => {
 // Set Pi volume setting
 app.post('/api/pi/volume', async (req, res) => {
   const { volume } = req.body;
-  if (volume === undefined || volume < 0 || volume > 100) {
+  const parsedVolume = Number.parseInt(volume, 10);
+  if (!Number.isFinite(parsedVolume) || parsedVolume < 0 || parsedVolume > 100) {
     return res.status(400).json({ error: 'Volume must be between 0 and 100' });
   }
   try {
     const volumeFile = '/home/admin/percel/volume_config.json';
-    const config = JSON.stringify({ volume: parseInt(volume) });
-    const command = `echo '${config}' > ${volumeFile} && chmod 644 ${volumeFile}`;
+    const config = JSON.stringify({ volume: parsedVolume });
+    const command = [
+      `echo '${config}' > ${volumeFile}`,
+      `chmod 644 ${volumeFile}`,
+      `echo 1234 | sudo -S amixer -q sset Master ${parsedVolume}% unmute 2>/dev/null || true`,
+      `echo 1234 | sudo -S amixer -q sset Speaker ${parsedVolume}% unmute 2>/dev/null || true`,
+      `echo 1234 | sudo -S amixer -q sset PCM ${parsedVolume}% unmute 2>/dev/null || true`,
+      `XDG_RUNTIME_DIR=/run/user/1000 pactl set-sink-volume @DEFAULT_SINK@ ${parsedVolume}% 2>/dev/null || true`,
+    ].join(' ; ');
     await executeSSHCommand(command);
-    addOCRLog(`🔊 Volume set to ${volume}%`);
-    res.json({ success: true, volume: parseInt(volume) });
+    addOCRLog(`🔊 Volume set to ${parsedVolume}%`);
+    res.json({ success: true, volume: parsedVolume });
   } catch (err) {
     console.error('Error setting Pi volume:', err);
     res.status(500).json({ error: 'Failed to set Pi volume', details: err.message });
@@ -1035,7 +1051,15 @@ tts = gTTS(text='${escapedSpeak}', lang='th')
 tts.save('/tmp/speak_remote.mp3')
 env = os.environ.copy()
 env['XDG_RUNTIME_DIR'] = '/run/user/1000'
-subprocess.run(['mpv', '--no-video', '--speed=1.5', '--ao=alsa', '/tmp/speak_remote.mp3'], env=env)
+volume = 80
+try:
+  import json
+  with open('/home/admin/percel/volume_config.json', 'r', encoding='utf-8') as f:
+    volume = int(json.load(f).get('volume', 80))
+except Exception:
+  volume = 80
+volume = max(0, min(100, volume))
+subprocess.run(['mpv', '--no-video', '--speed=1.5', '--ao=alsa', f'--volume={volume}', '/tmp/speak_remote.mp3'], env=env)
 " > /dev/null 2>&1 &`;
     
     // Speak in background (don't wait)
@@ -1093,7 +1117,15 @@ tts = gTTS(text='กำลังรีบูทระบบ', lang='th')
 tts.save('/tmp/speak_remote.mp3')
 env = os.environ.copy()
 env['XDG_RUNTIME_DIR'] = '/run/user/1000'
-subprocess.run(['mpv', '--no-video', '--speed=1.5', '--ao=alsa', '/tmp/speak_remote.mp3'], env=env)
+volume = 80
+try:
+  import json
+  with open('/home/admin/percel/volume_config.json', 'r', encoding='utf-8') as f:
+    volume = int(json.load(f).get('volume', 80))
+except Exception:
+  volume = 80
+volume = max(0, min(100, volume))
+subprocess.run(['mpv', '--no-video', '--speed=1.5', '--ao=alsa', f'--volume={volume}', '/tmp/speak_remote.mp3'], env=env)
 " > /dev/null 2>&1 &`;
     
     executeSSHCommand(speakCmd).catch(() => {});
