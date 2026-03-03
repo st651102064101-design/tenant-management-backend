@@ -727,6 +727,10 @@ app.post('/api/pi/telegram/test', async (req, res) => {
     }
 
     addOCRLog('📨 Telegram test message sent successfully');
+    if (telegramResult.result) {
+      appendTelegramMessages([mapTelegramMessage(telegramResult.result, 0)]);
+      telegramMsgCache.updatedAt = Date.now();
+    }
     return res.json({
       success: true,
       message: 'Telegram test sent successfully',
@@ -872,6 +876,10 @@ app.post('/api/pi/capture-telegram', async (req, res) => {
     }
 
     addOCRLog('📸 Capture + OCR + Telegram sent successfully');
+    if (parsed.telegram && parsed.telegram.result) {
+      appendTelegramMessages([mapTelegramMessage(parsed.telegram.result, 0)]);
+      telegramMsgCache.updatedAt = Date.now();
+    }
     return res.json({
       success: true,
       message: 'ถ่ายภาพและส่ง OCR ไป Telegram สำเร็จ',
