@@ -34,6 +34,11 @@ const clients = new Set();
 // In-memory log storage for OCR activities
 const ocrLogs = [];
 const MAX_LOGS = 500;
+const SYSTEM_LOG_CACHE_MS = 8000;
+const systemLogCache = {
+  updatedAt: 0,
+  logs: [],
+};
 
 function addOCRLog(message) {
   const logEntry = {
@@ -584,6 +589,67 @@ async function executeSSHCommand(command) {
 
 function shellSingleQuote(value) {
   return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
+function extractSystemErrorLogs(journalOutput) {
+  const lines = (journalOutput || '').split('\n').map((line) => line.trim()).filter(Boolean);
+  const errorPatterns = [
+    /unauthenticated/i,
+    /account_state_invalid/i,
+    /traceback/i,
+    /exception/i,
+    /error:/i,
+    /grpc\._channel/i,
+    /google\.api_core\.exceptions/i,
+    /vision\.googleapis\.com/i,
+  ];
+
+  const extracted = [];
+  for (const line of lines) {
+    if (!errorPatterns.some((pattern) => pattern.test(line))) {
+      continue;
+    }
+
+    const match = line.match(/^([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+[^\s]+\s+[^:]+:\s*(.*)$/);
+    if (match) {
+      extracted.push({
+        time: match[1],
+        message: `[SYSTEM] ${match[2]}`,
+        source: 'system',
+      });
+    } else {
+      extracted.push({
+        time: new Date().toISOString(),
+        message: `[SYSTEM] ${line}`,
+        source: 'system',
+      });
+    }
+  }
+
+  const deduped = [];
+  const seen = new Set();
+  for (const log of extracted) {
+    const key = `${log.time}|${log.message}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(log);
+  }
+
+  return deduped.slice(-120);
+}
+
+async function getPiSystemErrorLogs() {
+  const now = Date.now();
+  if (now - systemLogCache.updatedAt < SYSTEM_LOG_CACHE_MS) {
+    return systemLogCache.logs;
+  }
+
+  const journalResult = await executeSSHCommand('journalctl -u ocr.service --no-pager -n 220 2>/dev/null || true');
+  const logs = extractSystemErrorLogs(journalResult.output || '');
+
+  systemLogCache.updatedAt = now;
+  systemLogCache.logs = logs;
+  return logs;
 }
 
 // Speak on Pi via TTS
@@ -1152,9 +1218,14 @@ subprocess.run(['mpv', '--no-video', '--speed=1.5', '--ao=alsa', f'--volume={vol
 // Get OCR logs in realtime
 app.get('/api/pi/logs', async (req, res) => {
   try {
+    const systemLogs = await getPiSystemErrorLogs().catch(() => []);
+    const mergedLogs = [...ocrLogs, ...systemLogs];
+
     res.json({
       success: true,
-      logs: ocrLogs,
+      logs: mergedLogs,
+      appLogCount: ocrLogs.length,
+      systemLogCount: systemLogs.length,
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -1164,6 +1235,149 @@ app.get('/api/pi/logs', async (req, res) => {
 });
 
 // Clear OCR logs
+// Execute arbitrary SSH command on Pi (for debugging/admin)
+app.post('/api/pi/ssh', async (req, res) => {
+  const { command } = req.body;
+  if (!command) {
+    return res.status(400).json({ error: 'Missing command parameter' });
+  }
+  try {
+    const result = await executeSSHCommand(command);
+    res.json({ success: true, output: result.output });
+  } catch (err) {
+    console.error('SSH command error:', err);
+    res.status(500).json({ error: 'SSH command failed', details: err.message });
+  }
+});
+
+// Get GCP credential status from Pi (includes API validity test)
+app.get('/api/pi/credential', async (req, res) => {
+  try {
+    const result = await executeSSHCommand(
+      'stat -c "%s %Y" /home/admin/percel/pi-ocr-key.json 2>/dev/null && ' +
+      'cat /home/admin/percel/pi-ocr-key.json | grep -oP \'"client_email":\\s*"\\K[^"]+\' && ' +
+      'cat /home/admin/percel/pi-ocr-key.json | grep -oP \'"project_id":\\s*"\\K[^"]+\' && ' +
+      'cat /home/admin/percel/pi-ocr-key.json | grep -oP \'"private_key_id":\\s*"\\K[^"]+\' || echo NOT_FOUND'
+    );
+    const lines = (result.output || '').trim().split('\n');
+    if (lines[0] === 'NOT_FOUND' || lines.length < 4) {
+      return res.json({ exists: false, apiValid: false });
+    }
+    const [sizeAndTime, clientEmail, projectId, keyId] = lines;
+    const [size, mtime] = sizeAndTime.split(' ');
+
+    // Test if the credential actually works by calling Vision API
+    let apiValid = false;
+    let apiError = '';
+    try {
+      const testResult = await executeSSHCommand(
+        `cd /home/admin/percel && GOOGLE_APPLICATION_CREDENTIALS=pi-ocr-key.json ` +
+        `/home/admin/percel/venv/bin/python -c "` +
+        `from google.cloud import vision; import base64; ` +
+        `c = vision.ImageAnnotatorClient(); ` +
+        `png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='); ` +
+        `img = vision.Image(content=png); ` +
+        `r = c.text_detection(image=img); ` +
+        `print('API_OK')" 2>&1`
+      );
+      const output = (testResult.output || '').trim();
+      apiValid = output.endsWith('API_OK');
+      if (!apiValid) {
+        // Extract the key error line (prefer Unauthenticated/401 lines over generic Traceback)
+        const lines = output.split('\n');
+        const errorLine = lines.find(l => l.includes('Unauthenticated') || l.includes('ACCOUNT_STATE'))
+          || lines.find(l => l.includes('401'))
+          || lines.find(l => l.includes('PermissionDenied') || l.includes('Forbidden'))
+          || lines[lines.length - 1]
+          || output.substring(0, 200);
+        apiError = errorLine.trim().substring(0, 300);
+      }
+    } catch (testErr) {
+      apiError = testErr.message;
+    }
+
+    res.json({
+      exists: true,
+      clientEmail,
+      projectId,
+      keyId: keyId ? keyId.substring(0, 8) + '...' : 'N/A',
+      fileSize: parseInt(size, 10),
+      lastModified: new Date(parseInt(mtime, 10) * 1000).toISOString(),
+      apiValid,
+      apiError,
+    });
+  } catch (err) {
+    console.error('Error checking credential:', err);
+    res.status(500).json({ error: 'Failed to check credential', details: err.message });
+  }
+});
+
+// Upload new GCP credential JSON to Pi
+app.post('/api/pi/credential', async (req, res) => {
+  const { credential } = req.body;
+  if (!credential) {
+    return res.status(400).json({ error: 'Missing credential JSON' });
+  }
+  try {
+    // Validate it's proper JSON with required fields
+    let parsed;
+    try {
+      parsed = typeof credential === 'string' ? JSON.parse(credential) : credential;
+    } catch {
+      return res.status(400).json({ error: 'Invalid JSON format' });
+    }
+    if (!parsed.type || !parsed.client_email || !parsed.private_key) {
+      return res.status(400).json({ error: 'Invalid service account key: missing required fields (type, client_email, private_key)' });
+    }
+
+    // Base64 encode to avoid shell escaping issues
+    const jsonStr = JSON.stringify(parsed, null, 2);
+    const b64 = Buffer.from(jsonStr).toString('base64');
+
+    // Backup old key and write new one
+    await executeSSHCommand(
+      `cp /home/admin/percel/pi-ocr-key.json /home/admin/percel/pi-ocr-key.json.bak 2>/dev/null || true && ` +
+      `echo '${b64}' | base64 -d > /home/admin/percel/pi-ocr-key.json`
+    );
+
+    // Restart OCR service to pick up new credentials
+    await executeSSHCommand('echo 1234 | sudo -S systemctl restart ocr.service 2>/dev/null');
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const statusResult = await executeSSHCommand('systemctl is-active ocr.service');
+    const status = statusResult.output.trim();
+
+    addOCRLog(`🔑 GCP credential updated (${parsed.client_email}), service: ${status}`);
+    systemLogCache.updatedAt = 0; // invalidate system log cache
+
+    res.json({
+      success: true,
+      message: 'Credential updated and service restarted',
+      clientEmail: parsed.client_email,
+      projectId: parsed.project_id,
+      serviceStatus: status,
+      isRunning: status === 'active',
+    });
+  } catch (err) {
+    addOCRLog(`❌ Failed to update credential: ${err.message}`);
+    console.error('Error uploading credential:', err);
+    res.status(500).json({ error: 'Failed to upload credential', details: err.message });
+  }
+});
+
+// Clear old images from motion inbox
+app.post('/api/pi/inbox/clear', async (req, res) => {
+  try {
+    const countResult = await executeSSHCommand('ls /var/lib/motion/inbox/ 2>/dev/null | wc -l');
+    const count = parseInt((countResult.output || '0').trim(), 10);
+    await executeSSHCommand('rm -f /var/lib/motion/inbox/*.jpg');
+    addOCRLog(`🗑️ Cleared ${count} images from inbox`);
+    res.json({ success: true, cleared: count });
+  } catch (err) {
+    console.error('Error clearing inbox:', err);
+    res.status(500).json({ error: 'Failed to clear inbox', details: err.message });
+  }
+});
+
 app.delete('/api/pi/logs', async (req, res) => {
   try {
     const clearedCount = ocrLogs.length;
