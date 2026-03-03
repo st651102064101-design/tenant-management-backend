@@ -688,6 +688,57 @@ echo "Speak started"`;
   }
 });
 
+// Send a Telegram test message using Pi OCR service credentials
+app.post('/api/pi/telegram/test', async (req, res) => {
+  const { message } = req.body || {};
+  const textToSend = (message && String(message).trim()) || `🧪 Telegram test from Tenant Manager (${new Date().toLocaleString('th-TH')})`;
+
+  try {
+    const safeMessage = shellSingleQuote(textToSend);
+    const command = [
+      "token=$(systemctl show ocr.service --property=Environment --value 2>/dev/null | tr ' ' '\\n' | grep '^TELEGRAM_BOT_TOKEN=' | head -1 | cut -d= -f2-)",
+      "chat=$(systemctl show ocr.service --property=Environment --value 2>/dev/null | tr ' ' '\\n' | grep '^TELEGRAM_CHAT_ID=' | head -1 | cut -d= -f2-)",
+      "if [ -z \"$token\" ]; then token=$(grep -oP '^Environment=TELEGRAM_BOT_TOKEN=\\K.*' /etc/systemd/system/ocr.service 2>/dev/null | tail -1); fi",
+      "if [ -z \"$chat\" ]; then chat=$(grep -oP '^Environment=TELEGRAM_CHAT_ID=\\K.*' /etc/systemd/system/ocr.service 2>/dev/null | tail -1); fi",
+      `msg=${safeMessage}`,
+      "if [ -z \"$token\" ] || [ -z \"$chat\" ]; then echo '{\"ok\":false,\"description\":\"Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in ocr.service\"}'; exit 0; fi",
+      "resp=$(curl -sS -X POST \"https://api.telegram.org/bot${token}/sendMessage\" --data-urlencode \"chat_id=${chat}\" --data-urlencode \"text=${msg}\" 2>/dev/null || echo '{\"ok\":false,\"description\":\"Failed to call Telegram API\"}')",
+      "echo \"$resp\"",
+    ].join(' ; ');
+
+    const result = await executeSSHCommand(command);
+    const lines = (result.output || '').split('\n').map((line) => line.trim()).filter(Boolean);
+    const lastLine = lines[lines.length - 1] || '{}';
+
+    let telegramResult;
+    try {
+      telegramResult = JSON.parse(lastLine);
+    } catch {
+      telegramResult = { ok: false, description: `Unexpected Telegram response: ${lastLine}` };
+    }
+
+    if (!telegramResult.ok) {
+      addOCRLog(`❌ Telegram test failed: ${telegramResult.description || 'Unknown error'}`);
+      return res.status(500).json({
+        success: false,
+        error: telegramResult.description || 'Telegram send failed',
+        telegram: telegramResult,
+      });
+    }
+
+    addOCRLog('📨 Telegram test message sent successfully');
+    return res.json({
+      success: true,
+      message: 'Telegram test sent successfully',
+      telegram: telegramResult,
+    });
+  } catch (err) {
+    addOCRLog(`❌ Telegram test failed: ${err.message}`);
+    console.error('Error sending Telegram test:', err);
+    return res.status(500).json({ error: 'Failed to send Telegram test', details: err.message });
+  }
+});
+
 // Get Pi volume setting
 app.get('/api/pi/volume', async (req, res) => {
   try {
