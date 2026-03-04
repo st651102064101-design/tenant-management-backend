@@ -9,8 +9,8 @@ require('dotenv').config();
 module.exports = {
   // Server Configuration
   server: {
-    port: parseInt(process.env.PORT),
-    host: process.env.HOST,
+    port: parseInt(process.env.PORT || '36149', 10),
+    host: process.env.HOST || '0.0.0.0',
   },
 
   // Database Configuration

@@ -1451,8 +1451,20 @@ app.post('/api/pi/wifi', async (req, res) => {
       });
     }
 
-    // best effort: keep profile auto-connect; do not fail whole request if this step errors
-    await executeSSHCommand(`echo 1234 | sudo -S nmcli connection modify ${shellSingleQuote(wifi.connection)} connection.autoconnect yes`).catch(() => {});
+    // Persist profile so it auto-connects after reboot / AP power-cycle.
+    // • autoconnect yes         — reconnect when interface comes up
+    // • autoconnect-retries 0   — retry forever (default=4 then give up)
+    // • autoconnect-priority 100— highest priority profile
+    // • wifi.powersave 2        — disable wifi power-save (causes drops on Pi)
+    const connName = shellSingleQuote(wifi.connection);
+    await executeSSHCommand(
+      `echo 1234 | sudo -S nmcli connection modify ${connName} ` +
+      `connection.autoconnect yes connection.autoconnect-retries 0 ` +
+      `connection.autoconnect-priority 100 wifi.powersave 2`
+    ).catch(() => {});
+
+    // Deploy WiFi watchdog so Pi reconnects even after full power-cycle
+    await deployWifiWatchdog().catch((e) => console.error('[wifi-watchdog] deploy failed:', e.message));
 
     addOCRLog(`📶 Wi-Fi updated to SSID: ${ssid}`);
     res.json({
@@ -1582,6 +1594,150 @@ app.post('/api/pi/network/prefer', async (req, res) => {
   } catch (err) {
     console.error('Error switching preferred network:', err);
     res.status(500).json({ error: 'Failed to switch preferred network', details: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// WiFi Watchdog — a small systemd service deployed on the Pi that checks
+// WiFi connectivity every 30 seconds and reconnects if disconnected.
+// This ensures auto-reconnect survives full power-off → power-on cycles.
+// ---------------------------------------------------------------------------
+
+const WIFI_WATCHDOG_SCRIPT = `#!/bin/bash
+# wifi-watchdog: auto-reconnect WiFi on Raspberry Pi
+# Deployed by tenant-management backend
+# Handles: AP power-cycle, Pi reboot, Pi fully offline then AP returns
+
+IFACE="wlan0"
+WAIT=15
+
+get_wifi_state() {
+  nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | grep "^\${IFACE}:wifi:" | cut -d: -f3
+}
+
+while true; do
+  STATE=$(get_wifi_state)
+
+  if [ "$STATE" = "connected" ]; then
+    sleep $WAIT
+    continue
+  fi
+
+  logger -t wifi-watchdog "wlan0 state='$STATE' — starting reconnect sequence"
+
+  # Step 1: Ensure WiFi radio is ON (may be off after cold boot / rfkill)
+  RADIO=$(nmcli radio wifi 2>/dev/null)
+  if [ "$RADIO" != "enabled" ]; then
+    logger -t wifi-watchdog "WiFi radio is '$RADIO', enabling..."
+    nmcli radio wifi on 2>/dev/null || true
+    sleep 3
+  fi
+
+  # Step 2: If interface is unavailable/unmanaged, bring it up
+  if [ "$STATE" = "unavailable" ] || [ "$STATE" = "unmanaged" ] || [ -z "$STATE" ]; then
+    logger -t wifi-watchdog "Bringing up interface $IFACE..."
+    ip link set $IFACE up 2>/dev/null || true
+    nmcli dev set $IFACE managed yes 2>/dev/null || true
+    sleep 3
+  fi
+
+  # Step 3: Rescan for available networks (try twice for cold-start)
+  nmcli dev wifi rescan ifname $IFACE 2>/dev/null || true
+  sleep 4
+  nmcli dev wifi rescan ifname $IFACE 2>/dev/null || true
+  sleep 2
+
+  # Step 4: Try generic device connect (uses highest-priority autoconnect profile)
+  nmcli dev connect $IFACE 2>/dev/null || true
+  sleep 5
+
+  STATE2=$(get_wifi_state)
+  if [ "$STATE2" = "connected" ]; then
+    logger -t wifi-watchdog "Reconnected via dev connect"
+    sleep $WAIT
+    continue
+  fi
+
+  # Step 5: Explicitly try each saved WiFi profile (sorted by priority)
+  SAVED_LIST=$(nmcli -t -f NAME,TYPE connection show | grep ':802-11-wireless$' | cut -d: -f1)
+  if [ -n "$SAVED_LIST" ]; then
+    echo "$SAVED_LIST" | while IFS= read -r PROFILE; do
+      logger -t wifi-watchdog "Trying saved profile: $PROFILE"
+      nmcli connection up "$PROFILE" ifname $IFACE 2>/dev/null && break || true
+      sleep 2
+    done
+  fi
+
+  STATE3=$(get_wifi_state)
+  if [ "$STATE3" = "connected" ]; then
+    logger -t wifi-watchdog "Reconnected via saved profile"
+  else
+    logger -t wifi-watchdog "Still not connected (state=$STATE3), will retry in \${WAIT}s"
+  fi
+
+  sleep $WAIT
+done
+`;
+
+const WIFI_WATCHDOG_SERVICE = `[Unit]
+Description=WiFi Watchdog - auto reconnect wlan0
+After=network.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wifi-watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+`;
+
+async function deployWifiWatchdog() {
+  // 1. Write the watchdog script
+  const scriptB64 = Buffer.from(WIFI_WATCHDOG_SCRIPT).toString('base64');
+  await executeSSHCommand(
+    `echo '${scriptB64}' | base64 -d | sudo tee /usr/local/bin/wifi-watchdog.sh > /dev/null && ` +
+    `sudo chmod +x /usr/local/bin/wifi-watchdog.sh`
+  );
+
+  // 2. Write the systemd unit
+  const unitB64 = Buffer.from(WIFI_WATCHDOG_SERVICE).toString('base64');
+  await executeSSHCommand(
+    `echo '${unitB64}' | base64 -d | sudo tee /etc/systemd/system/wifi-watchdog.service > /dev/null`
+  );
+
+  // 3. Enable & start the service
+  await executeSSHCommand(
+    'echo 1234 | sudo -S systemctl daemon-reload && ' +
+    'echo 1234 | sudo -S systemctl enable wifi-watchdog.service && ' +
+    'echo 1234 | sudo -S systemctl restart wifi-watchdog.service'
+  );
+
+  console.log('[wifi-watchdog] deployed and started on Pi');
+}
+
+// Manual endpoint to deploy / check the WiFi watchdog service
+app.post('/api/pi/wifi/watchdog', async (req, res) => {
+  try {
+    await deployWifiWatchdog();
+    const statusResult = await executeSSHCommand('systemctl is-active wifi-watchdog.service 2>/dev/null || echo inactive');
+    const status = (statusResult.output || '').trim();
+    res.json({ success: true, message: 'WiFi watchdog deployed', status });
+  } catch (err) {
+    console.error('Error deploying WiFi watchdog:', err);
+    res.status(500).json({ error: 'Failed to deploy WiFi watchdog', details: err.message });
+  }
+});
+
+app.get('/api/pi/wifi/watchdog', async (req, res) => {
+  try {
+    const statusResult = await executeSSHCommand('systemctl is-active wifi-watchdog.service 2>/dev/null || echo inactive');
+    const status = (statusResult.output || '').trim();
+    res.json({ success: true, status, isRunning: status === 'active' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to check watchdog status', details: err.message });
   }
 });
 
@@ -2097,8 +2253,8 @@ setInterval(async () => {
 }, 3000); // every 3 seconds
 
 console.log('[server-start] server.js file:', __filename);
-server.listen(port, () => {
-  const host = process.env.HOST;
+server.listen(port, serverConfig.host, () => {
+  const host = serverConfig.host;
   console.log('[server-start] Backend server listening at', `http://${host}:${port}`);
   console.log('[server-start] WebSocket server listening at', `ws://${host}:${port}`);
 });
