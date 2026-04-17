@@ -4,7 +4,9 @@
   "private": true,
   "description": "Backend API for managing tenants, scanned packages and reports",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "pm2:start": "npx pm2 start ecosystem.config.cjs --only tenant-management-backend",
+    "pm2:restart": "npx pm2 restart tenant-management-backend"
   },
   "dependencies": {
     "cors": "^2.8.5",
